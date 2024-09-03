@@ -54,58 +54,25 @@ class astlingen(basescenario):
         # return __object
         return np.array(__object).sum(axis=-1) if seq else np.array(__object)
          
-    def reward(self,norm=False):
-        # Calculate the target error in the recent step based on cumulative values
-        __reward = 0.0
-        __sumnorm = 0.0
-        for ID, attribute, weight in self.config["reward"]:
-            if self.env._isFinished:
-                __cumvolume = self.data_log[attribute][ID][-1]
-            else:
-                __cumvolume = self.env.methods[attribute](ID)
-            # Recent volume has been logged
-            if len(self.data_log[attribute][ID]) > 1:
-                __volume = __cumvolume - self.data_log[attribute][ID][-2]
-            else:
-                __volume = __cumvolume
-
-            if attribute == "totalinflow" and ID not in ["Out_to_WWTP","system"]:
-                if len(self.data_log[attribute][ID]) > 2:
-                    __prevolume = self.data_log[attribute][ID][-2] - self.data_log[attribute][ID][-3]
-                elif len(self.data_log[attribute][ID]) == 2:
-                    __prevolume = self.data_log[attribute][ID][-2]
-                else:
-                    __prevolume = 0
-                __volume = abs(__volume - __prevolume)
-            # __weight = self.penalty_weight[ID]
-            if ID == 'system':
-                __sumnorm += __volume * weight
-            else:
-                __reward += __volume * weight
-        if norm:
-            return - __reward/(__sumnorm + 1e-5)
-        else:
-            return - __reward
-
     def objective_pred(self,preds,states,settings,gamma=None,norm=False):
         preds,_ = preds
         state,_ = states
         q_w = preds[...,-1]
         q_in = np.concatenate([state[:,-1:,:,1],preds[...,1]],axis=1)
-        flood = [(q_w[...,self.elements['nodes'].index(idx)]*gamma).sum(axis=1) * weight
+        flood = [q_w[...,self.elements['nodes'].index(idx)] * weight
                 for idx,attr,weight in self.config['performance_targets'] if attr == 'cumflooding']
-        inflow = [np.abs(np.diff(q_in[...,self.elements['nodes'].index(idx)],axis=1)*gamma).sum(axis=1) * weight
+        inflow = [np.abs(np.diff(q_in[...,self.elements['nodes'].index(idx)],axis=1)) * weight
                 for idx,attr,weight in self.config['performance_targets']
                     if attr == 'cuminflow' and 'WWTP' not in idx]
-        outflow = [(q_in[:,1:,self.elements['nodes'].index(idx)]*gamma).sum(axis=1) * weight
+        outflow = [q_in[:,1:,self.elements['nodes'].index(idx)] * weight
                 for idx,attr,weight in self.config['performance_targets']
                     if attr == 'cuminflow' and 'WWTP' in idx]
-        obj = np.stack(flood + outflow + inflow,axis=0)
+        obj = np.concatenate(flood + outflow + inflow,axis=0)
         gamma = np.ones(preds.shape[1]) if gamma is None else np.array(gamma,dtype=np.float32)
         obj *= gamma
         if norm:
-            obj /= state[...,-1].sum(axis=-1)
-        return obj.sum(axis=-1).T
+            obj /= (state[...,-1].sum(axis=-1).sum(axis=-1)+1e-5)
+        return obj.sum(axis=-1)
     
     def objective_pred_tf(self,preds,states,settings,gamma=None,norm=False):
         import tensorflow as tf
@@ -123,10 +90,9 @@ class astlingen(basescenario):
                     if attr == 'cuminflow' and 'WWTP' in idx]
         obj = tf.reduce_sum(flood,axis=0) + tf.reduce_sum(inflow,axis=0) + tf.reduce_sum(outflow,axis=0)
         gamma = tf.ones((preds.shape[1],)) if gamma is None else tf.convert_to_tensor(gamma,dtype=tf.float32)
+        obj = tf.reduce_sum(obj*gamma,axis=-1)
         if norm:
-            obj = tf.reduce_sum(obj*gamma/tf.reduce_sum(state[...,-1],axis=-1),axis=-1)
-        else:
-            obj = tf.reduce_sum(obj*gamma,axis=-1)
+            obj /= (tf.reduce_sum(tf.reduce_sum(state[...,-1],axis=-1),axis=-1)+1e-5)
         return obj
 
     def get_action_space(self,act='rand'):
@@ -175,7 +141,7 @@ class astlingen(basescenario):
                 # args['action_shape'] = np.array(list(args['action_table'].keys())).max(axis=0)+1
             else:
                 args['n_agents'] = 1
-                args['observ_space'] = args['state_shape']
+                args['observ_space'] = self.config['states']
                 # args['action_shape'] = len(args['action_table'])
         return args
 

@@ -76,6 +76,7 @@ docs/_build/
 target/
 
 # Jupyter Notebook
+*.ipynb
 .ipynb_checkpoints
 
 # IPython
@@ -151,21 +152,24 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 *.npy
-!norm_x.npy
-!norm_y.npy
-!norm_e.npy
-!norm_b.npy
-!train_loss.npy
-!test_loss.npy
-!train_id.npy
-!test_id.npy
+# !norm_x.npy
+# !norm_y.npy
+# !norm_e.npy
+# !norm_b.npy
+# !train_loss.npy
+# !test_loss.npy
+# !train_id.npy
+# !test_id.npy
+!train_id_*.npy
+*.h5
 *.inp
 *.out
 *.rpt
 *.png
 *.hsf
-*.ipynb
 *.json
+*.rar
+*.v2
 !hague.inp
 !shunqing.inp
 !astlingen.inp

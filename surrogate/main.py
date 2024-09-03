@@ -4,7 +4,7 @@ from utils.utilities import get_inp_files
 import argparse,yaml
 from envs import get_env
 import numpy as np
-import os,time
+import os,time,datetime
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras.utils import plot_model
@@ -26,6 +26,7 @@ def parser(config=None):
     # simulate args
     parser.add_argument('--simulate',action="store_true",help='if simulate rainfall events for training data')
     parser.add_argument('--data_dir',type=str,default='./envs/data/',help='the sampling data file')
+    parser.add_argument('--train_event_id',type=str,default='',help='the training event id file')
     parser.add_argument('--act',type=str,default='False',help='if and what control actions')
     parser.add_argument('--setting_duration',type=int,default=5,help='setting duration')
     parser.add_argument('--processes',type=int,default=1,help='number of simulation processes')
@@ -43,6 +44,7 @@ def parser(config=None):
     parser.add_argument('--epochs',type=int,default=500,help='training epochs')
     parser.add_argument('--save_gap',type=int,default=100,help='save model per epochs')
     parser.add_argument('--batch_size',type=int,default=256,help='training batch size')
+    parser.add_argument('--roll',type=int,default=0,help='if rolls out for curriculum learning')
     parser.add_argument('--balance',action="store_true",help='if use balance not classification loss')
 
     # network args
@@ -97,19 +99,22 @@ if __name__ == "__main__":
 
     # train_de = {'train':True,
     #             'env':'astlingen',
-    #             'length':1000,
-    #             'data_dir':'./envs/data/astlingen/1s_edge_conti_rain50/',
+    #             'length':501,
+    #             'data_dir':'./envs/data/astlingen/1s_edge_conti128_rain50/',
     #             'act':'conti',
-    #             'model_dir':'./model/shunqing/30s_20k_conti_1000ledgef_res_norm_flood_gat/',
+    #             'model_dir':'./model/astlingen/5s_20k_conti_500ledgef_res_norm_flood_gat/',
+    #             'load_model':True,
+    #             'roll':12,
     #             'batch_size':128,
     #             'epochs':5000,
-    #             'n_tp_layer':4,
+    #             'n_sp_layer':3,
+    #             'n_tp_layer':3,
     #             'resnet':True,
     #             'norm':True,
     #             'use_edge':True,'edge_fusion':True,
     #             'balance':False,
-    #             'seq_in':30,'seq_out':30,
-    #             'if_flood':True,
+    #             'seq_in':5,'seq_out':5,
+    #             'if_flood':3,
     #             'conv':'GAT',
     #             'recurrent':'Conv1D'}
     # for k,v in train_de.items():
@@ -133,7 +138,7 @@ if __name__ == "__main__":
     # for k,v in test_de.items():
     #     setattr(args,k,v)
 
-    env = get_env(args.env)()
+    env = get_env(args.env)(initialize=False)
     env_args = env.get_args(args.directed,args.length,args.order)
     for k,v in env_args.items():
         if k == 'act':
@@ -141,7 +146,7 @@ if __name__ == "__main__":
         setattr(args,k,v)
     args.use_edge = args.use_edge or args.edge_fusion
 
-    dG = DataGenerator(env,args.data_dir,args)
+    dG = DataGenerator(env.config,args.data_dir,args)
     
     if args.simulate:
         if not os.path.exists(args.data_dir):
@@ -162,29 +167,39 @@ if __name__ == "__main__":
         dG.load(args.data_dir)
         if not os.path.exists(args.model_dir):
             os.mkdir(args.model_dir)
-        emul = Emulator(args.conv,args.resnet,args.recurrent,args)
-        # plot_model(emul.model,os.path.join(args.model_dir,"model.png"),show_shapes=True)
-        yaml.dump(data=config,stream=open(os.path.join(args.model_dir,'parser.yaml'),'w'))
 
         seq = max(args.seq_in,args.seq_out) if args.recurrent else 0
+        seq *= args.roll if args.roll > 0 else 1
         n_events = int(max(dG.event_id))+1
-
-        if args.load_model:
-            emul.load(args.model_dir)
+        if os.path.isfile(os.path.join(args.data_dir,args.train_event_id)):
+            train_ids = np.load(os.path.join(args.data_dir,args.train_event_id))
+        elif args.load_model:
             train_ids = np.load(os.path.join(args.model_dir,'train_id.npy'))
         else:
             train_ids = np.random.choice(np.arange(n_events),int(n_events*args.ratio),replace=False)
         test_ids = [ev for ev in range(n_events) if ev not in train_ids]
+        train_idxs = dG.get_data_idxs(train_ids,seq)
+        test_idxs = dG.get_data_idxs(test_ids,seq)
+
+        emul = Emulator(args.conv,args.resnet,args.recurrent,args)
+        # plot_model(emul.model,os.path.join(args.model_dir,"model.png"),show_shapes=True)
+        if args.load_model:
+            emul.load(args.model_dir)
+            args.model_dir = os.path.join(args.model_dir,'retrain')
+            if not os.path.exists(args.model_dir):
+                os.mkdir(args.model_dir)
+            if 'model_dir' in config:
+                config['model_dir'] += '/retrain'
         if args.norm:
             emul.set_norm(*dG.get_norm())
-
-        train_idxs = dG.get_data_idxs(seq,train_ids)
-        test_idxs = dG.get_data_idxs(seq,test_ids)
+        yaml.dump(data=config,stream=open(os.path.join(args.model_dir,'parser.yaml'),'w'))
 
         t0 = time.time()
         train_losses,test_losses,secs = [],[],[0]
+        log_dir = "logs/model/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
         for epoch in range(args.epochs):
-            train_dats = dG.prepare_batch(train_idxs,seq,args.batch_size)
+            train_dats = dG.prepare_batch(train_idxs,seq,args.batch_size,trim=False)
             x,a,b,y = [dat if dat is not None else dat for dat in train_dats[:4]]
             if args.norm:
                 x,b,y = [emul.normalize(dat,item) for dat,item in zip([x,b,y],'xby')]
@@ -199,7 +214,7 @@ if __name__ == "__main__":
             if epoch >= 500:
                 train_losses.append(train_loss)
 
-            test_dats = dG.prepare_batch(test_idxs,seq,args.batch_size)
+            test_dats = dG.prepare_batch(test_idxs,seq,args.batch_size,trim=False)
             x,a,b,y = [dat if dat is not None else dat for dat in test_dats[:4]]
             if args.norm:
                 x,b,y = [emul.normalize(dat,item) for dat,item in zip([x,b,y],'xby')]
@@ -218,7 +233,7 @@ if __name__ == "__main__":
                 emul.save(os.path.join(args.model_dir,'train'))
             if sum(test_loss) < min([1e6]+[sum(los) for los in test_losses[:-1]]):
                 emul.save(os.path.join(args.model_dir,'test'))
-            if epoch > 0 and epoch % emul.save_gap == 0:
+            if epoch > 0 and epoch % args.save_gap == 0:
                 emul.save(os.path.join(args.model_dir,'%s'%epoch))
                 
             secs.append(time.time()-t0)
@@ -236,6 +251,14 @@ if __name__ == "__main__":
                 log += " Edge: {:.4f}".format(test_loss[i])
             log += ")"
             print(log)
+            with tf.summary.create_file_writer(log_dir).as_default():
+                tf.summary.scalar('Node loss', test_loss[0], step=epoch)
+                i = 1
+                if args.if_flood and not args.balance:
+                    tf.summary.scalar('Flood classification', test_loss[i], step=epoch)
+                    i += 1
+                if args.use_edge:
+                    tf.summary.scalar('Edge loss', test_loss[i], step=epoch)
 
 
         # save
@@ -255,6 +278,8 @@ if __name__ == "__main__":
         for k,v in known_hyps.items():
             if k in ['model_dir','act']:
                 continue
+            elif k == 'data_dir':
+                v = os.path.join(args.data_dir,v)
             setattr(args,k,v)
         env_args = env.get_args(args.directed,args.length,args.order)
         for k,v in env_args.items():
@@ -262,7 +287,7 @@ if __name__ == "__main__":
                 v = v and args.act != 'False' and args.act
             setattr(args,k,v)
         args.use_edge = args.use_edge or args.edge_fusion
-        dG = DataGenerator(env,args.data_dir,args)
+        dG = DataGenerator(env.config,args.data_dir,args)
         emul = Emulator(args.conv,args.resnet,args.recurrent,args)
         emul.load(args.model_dir)
         if not os.path.exists(args.result_dir):
@@ -276,6 +301,9 @@ if __name__ == "__main__":
         if 'rain_num' in config:
             rain_arg['rain_num'] = args.rain_num
         events = get_inp_files(env.config['swmm_input'],rain_arg)
+        if 'train_event_id' in config and os.path.isfile(os.path.join(args.data_dir,config['train_event_id'])):
+            train_ids = np.load(os.path.join(args.data_dir,config['train_event_id']))
+            events = [eve for i,eve in enumerate(events) if i not in train_ids]
         for event in events:
             name = os.path.basename(event).strip('.inp')
             if os.path.exists(os.path.join(args.result_dir,name + '_states.npy')):
@@ -288,7 +316,7 @@ if __name__ == "__main__":
             else:
                 t0 = time.time()
                 pre_step = rain_arg.get('pre_time',0) // args.interval
-                res = dG.simulate(event,act=args.act,hotstart=args.seq_out*args.hotstart)
+                res = dG.simulate(env,event,act=args.act,hotstart=args.seq_out*args.hotstart)
                 states,perfs,settings = [r[pre_step:] if r is not None else None for r in res[:3]]
                 print("{} Simulation time: {}".format(name,time.time()-t0))
                 np.save(os.path.join(args.result_dir,name + '_states.npy'),states)
@@ -360,12 +388,12 @@ if __name__ == "__main__":
                 los_str += "Edge: {:.4f}".format(loss[-1])
             print(los_str+')')
 
-            np.save(os.path.join(args.result_dir,name + '_runoff.npy'),r)
-            np.save(os.path.join(args.result_dir,name + '_true.npy'),true)
-            np.save(os.path.join(args.result_dir,name + '_pred.npy'),pred)
+            np.save(os.path.join(args.result_dir,name + '_runoff.npy'),r.astype(np.float32))
+            np.save(os.path.join(args.result_dir,name + '_true.npy'),true.astype(np.float32))
+            np.save(os.path.join(args.result_dir,name + '_pred.npy'),pred.astype(np.float32))
             if args.use_edge:
                 edge_true = edge_true[:,:args.seq_out,...] if args.recurrent else edge_true
-                np.save(os.path.join(args.result_dir,name + '_edge_true.npy'),edge_true)
-                np.save(os.path.join(args.result_dir,name + '_edge_pred.npy'),edge_pred)
+                np.save(os.path.join(args.result_dir,name + '_edge_true.npy'),edge_true.astype(np.float32))
+                np.save(os.path.join(args.result_dir,name + '_edge_pred.npy'),edge_pred.astype(np.float32))
 
 
